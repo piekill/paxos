@@ -1,0 +1,43 @@
+			CSE 535 Final Project
+                            Multi-Paxos
+                     Junxing Yang(id:108312768)
+			
+Files
+-----
+- paxos.da:     multi-paxos protocol
+- test0.da:     test case 0
+- test1.da:     test case 1
+- test2.da:     test case 2
+- other files:  DistAlgo-0.5
+
+Usage
+-----
+Run the test cases using:
+    $ python3 -m distalgo.runtime [testcase].da
+For example:
+    $ python3 -m distalgo.runtime  test0.da
+    
+Note that paxos.da cannot run without driver programs.
+
+Test cases
+----------
+
+Test case 0:
+    simply run the code with 5 acceptors, 5 replicas, 3 leaders, 5 clients.
+    no error.
+    the processes keep running unless no. of requests specified for clients.
+
+Test Case 1 -- acceptors' recovery:
+    1. run paxos with 5 acceptors, 5 replicas, 3 leaders, 5 clients
+    2. 3 acceptors terminate after 2 seconds (more than half)
+    3. clients won't receive results
+    4. 1 acceptor recovers after 2 seconds
+    5. clients will receive results again
+
+Test Case 2 -- leaders' recovery:
+    1. run paxos with 5 acceptors, 5 replicas, 3 leaders, 5 clients
+    2. all leaders terminate after 2 seconds
+    3. clients won't receive results
+    4. 1 leader recovers after 2 seconds
+    5. clients will receive results again
+

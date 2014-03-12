@@ -1,0 +1,50 @@
+dist_source(".","paxos.da")
+from paxos import *
+"""Test Case 1 -- acceptors' recovery:
+    1. run paxos with 5 acceptors, 5 replicas, 3 leaders, 5 clients
+    2. 3 acceptors terminate after 2 seconds (more than half)
+    3. clients won't receive results
+    4. 1 acceptor recovers after 2 seconds
+    5. clients will receive results again
+    """
+
+def main():
+    nacceptors = 5
+    nreplicas = 5
+    nleaders = 3
+    nclients = 5
+
+    use_channel("udp")
+    replicas = createprocs(Replica, nreplicas)    
+    acceptors = list(createprocs(Acceptor, nacceptors))
+    leaders = list(createprocs(Leader, nleaders))
+    #the second arg: 0 for infinite requests, >0 for finite requests and will stop the protocal
+    clients = createprocs(Client, nclients, (replicas, 0))
+    
+    for i in range(nacceptors):
+        setupprocs( [acceptors[i]], [leaders, i, False])
+    
+    for i in range(nleaders):
+        setupprocs( [leaders[i]], [acceptors, replicas, i, False])
+
+    setupprocs(replicas, (leaders, 0))
+
+    startprocs(acceptors)
+    startprocs(replicas | set(leaders))
+    startprocs(clients)
+    
+    #the first 3 acceptors terminate
+    time.sleep(2)
+    acceptors[0].terminate()
+    acceptors[1].terminate()
+    acceptors[2].terminate()
+    
+    #the 1st acceptor recovers
+    time.sleep(2)
+    re_acc = list(createprocs(Acceptor, 1))
+    acceptors[0] = re_acc[0]
+    setupprocs([re_acc[0]], [leaders, 0, True])
+    startprocs(re_acc)
+    
+    for p in set(acceptors) | replicas | set(leaders) | clients: p.join()
+

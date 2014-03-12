@@ -1,0 +1,17 @@
+#!/usr/bin/python3
+
+import sys
+import os.path as path
+
+binpath = sys.path[0]
+rootpath = path.dirname(path.abspath(binpath))
+sys.path.insert(0, rootpath)
+
+from distalgo.runtime.__main__ import libmain
+
+del binpath
+del rootpath
+del sys
+del path
+
+libmain()

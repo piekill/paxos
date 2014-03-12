@@ -1,0 +1,436 @@
+"""Multi-Paxos protocol
+
+Classes:
+    Acceptor
+    Client
+    Commander
+    Leader
+    Replica
+    Scout
+"""
+import pickle
+import time
+import random
+from random import randint
+
+NOPS = 10                       # Number of operations of the state machine
+
+#state+i according to the value of i(not NOPS)
+operations = {i: (lambda state, i=i: (state+i,state+i)) for i in range(NOPS)}
+
+class Replica(DistProcess):
+    def setup(leaders, initial_state):
+        '''set up the replica'''
+        state, slot_num = initial_state, 1
+        proposals, decisions = set(), set()
+        done = False
+        #use max_slot to keep track of the max slot_num in proposals and decisions
+        max_slot = 0
+        
+    def main():
+        '''wait for the client to send Stop msg'''
+        await(done)
+
+    def propose(p):
+        '''propose a proposal'''
+        if not {s for (s, p1) in decisions if p1 == p}:
+            #the next unused slot_num is the max in proposals and decisions + 1
+            #may waste some slot
+            s = max(max_slot, 0) + 1
+            proposals.add((s, p))
+            max_slot = s            
+            send(Propose(s, p), leaders)
+
+    def perform(p):
+        '''perform an operation'''
+        k, cid, op = p
+        if {s for (s, p0) in decisions if p0 == p and s < slot_num}:
+            slot_num += 1
+        else:
+            next, result = operations[op](state)
+            state, slot_num = next, slot_num + 1
+            send(Response(cid, result), k)
+            #remove old proposals -- state reduction
+            proposals -= set([(s1,p1) for (s1,p1) in proposals if s1 < slot_num])
+            #send msg to leaders when performed -- garbage collection
+            send(Performed(slot_num - 1), leaders)
+
+    def OnRequest(p):
+        '''when request comes, propose it'''
+        propose(p)
+
+    def OnDecision(s, p):
+        '''handle decision'''
+        decisions.add((s,p))
+        max_slot = max(max_slot, s)        
+        while {p1 for (s0,p1) in decisions if s0==slot_num}:
+            p1 = {p1 for (s0,p1) in decisions if s0==slot_num}.pop()
+            for p2 in {p2 for (s0,p2) in proposals if s0==slot_num if p2 != p1}:
+                propose(p2)
+            perform(p1)
+
+    def OnNotify(k, k_index):
+        '''when a leader recovers and sends notification, update leaders set and re-propose'''
+        leaders[k_index] = k
+        for (s1, p1) in proposals - decisions:
+            send(Propose(s1, p1), k)
+    
+    def OnStop():
+        '''client stops the protocol'''
+        send(Stop(), leaders)
+        done = True
+
+class Acceptor(DistProcess):
+    def setup(leaders, index, recovered):
+        '''set up the acceptor
+           index: identify acceptor because recovered process has different pid and port, also
+                  used to make sure it reads and writes the right log file
+           recovered: whether it starts normally or needs recovery
+        '''
+        ballot_num = (-1, -1)   # bottom
+        accepted = set()
+
+        self.leaders = leaders
+        self.index = index
+        #state: state of acceptor, will be saved on log file
+        state = [ballot_num, accepted]
+        #log: log file
+        log = None
+
+        if recovered :
+            recover()
+        else:
+            try:
+                log = open('./acceptor'+str(index)+'.log','wb',0)
+            except IOError:
+                output('cannot open log file')
+
+    def main():
+        '''wait for leaders to send Stop msg'''
+        await(received(Stop()))
+        try:
+            #no need to keep log when finished
+            os.remove('./acceptor'+str(index)+'.log')
+        except OSError:
+            output('cannot remove log file')
+    
+    def OnP1a(lam, b, first_slot):
+        '''P1a msg from Scout
+           first_slot: first slot_num the leader doesn't know the decision'''
+        if b > ballot_num:
+            ballot_num = b
+            #no need to respond with pvalue < first_slot -- state reduction
+            accepted -= set([(b1,s1,p1) for (b1,s1,p1) in accepted if s1 < first_slot])
+            #save the state
+            state[0] = ballot_num
+            state[1] = accepted
+            dump()
+
+        send(P1b(self, ballot_num, accepted), lam)
+
+    def OnP2a(lam, load):
+        '''P2a msg from Commander'''
+        b, s, p = load
+        if b >= ballot_num :
+            ballot_num = b
+            #remove old pvalues with a smaller ballot_num for each slot -- state reduction
+            accepted -= set([(b1,s1,p1) for (b1,s1,p1) in accepted if (b1 < b or p1 < p) and s1 == s])
+            accepted.add((b,s,p))
+            # the state
+            state[0] = ballot_num
+            state[1] = accepted
+            dump()
+        send(P2b(self, ballot_num), lam)
+    
+    #garbage collection
+    def OnRelease(s):
+        '''remove performed pvalues for garbage collection'''
+        accepted -= set([(b1,s1,p1) for (b1,s1,p1) in accepted if s1 == s])
+        state[1] = accepted
+        dump()
+
+    def recover():
+        '''recover from crash:
+           1. open log file
+           2. retrieve state
+           3. send notification to leaders
+        '''
+        try:
+            log = open('./acceptor'+str(index)+'.log','rb+',0)
+        except IOError:
+            output('recovery fails')
+        else:
+            try:
+                state = pickle.load(log)
+            except pickle.PickleError:
+                output('recovery fails')
+            else:
+                ballot_num = state[0]
+                accepted = state[1]
+        
+        send(Notify(self, index), leaders)
+
+    def OnNotify(k, k_index):
+        '''a leader recovers, update leaders set'''
+        leaders[k_index] = k
+    
+    def dump():
+        '''save the state to log file'''
+        log.truncate(0)
+        log.seek(0)
+        try:
+            pickle.dump(state, log)
+        except pickle.PickleError:
+            output('dump error')
+
+class Leader(DistProcess):
+    def setup(acceptors, replicas, index, recovered):
+        '''set up the leader
+           index: identify leader because recovered process has different pid and port, also
+                  used to make sure it reads and writes the right log file
+           recovered: whether it starts normally or needs recovery
+        '''
+
+        ballot_num = (0, self)
+        active = False
+        proposals = set()
+        
+        #first slot_num it doesn't know the decision
+        first_slot = -1
+        #dict performed: slot_num as keys and values initially be the number of replicas, 
+        #used to determine whether all replicas have performed a command
+        performed = dict()
+        
+        self.acceptors = acceptors
+        self.replicas = replicas
+        self.index = index
+        #state: state of the leader, will be saved on log file
+        state = [ballot_num, active, proposals, first_slot, performed]
+        #log: log file
+        log = None
+        done = False
+
+        if recovered:
+            recover()
+        else:
+            try:
+                log = open('./leader'+str(index)+'.log','wb',0)
+            except IOError:
+                output('cannot open log file')
+
+    def main():
+        '''spawn a Scout first, wait for replica to send Stop msg'''
+        spawn(Scout, [self, acceptors, ballot_num, first_slot])
+        await(done)
+        
+        try:
+            #no need to keep log file when finishes
+            os.remove('./leader'+str(index)+'.log')
+        except OSError:
+            output('cannot remove log file')
+        
+    def OnPropose(s, p):
+        '''handle proposal from replicas'''
+        #no need to handle proposals with slot_num < first_slot
+        if not {p1 for (s1, p1) in proposals if s1 == s} and s >= first_slot:
+            proposals.add((s,p))
+            #add proposal to dict performed
+            performed[s] = len(replicas)
+            if active:
+                spawn(Commander, [self, acceptors, replicas, (ballot_num, s, p)])
+            #save the state
+            state[2] = proposals
+            state[4] = performed
+            dump()
+
+    def OnAdopted(ballot_num_, pvals):
+        '''when ballot_num adopted by acceptors, spawn commanders for proposals'''
+        if ballot_num_ == ballot_num:
+            proposals = circle_plus(proposals, pmax(pvals))
+            for (s, p) in proposals:
+                spawn(Commander, [self, acceptors, replicas, (ballot_num, s, p)])
+            active = True
+            #save the state
+            state[2] = proposals
+            state[1] = active
+            dump()
+
+    def OnPreempted(b):
+        '''ballot_num preempted, try a new one with a new Scout'''
+        r1, lam1 = b
+        if b > ballot_num:
+            active = False
+            ballot_num = (r1+1, self)
+            spawn(Scout, [self, acceptors, ballot_num, first_slot])
+
+            state[1] = active
+            state[0] = ballot_num
+            dump()
+
+    def OnDecision(s, p):
+        '''A slot is decided, update firs_slot, remove old proposals -- state reduction'''
+        first_slot = s + 1
+        proposals -= set([(s1,p1) for (s1,p1) in proposals if s1 <= s])
+        state[3] = first_slot
+        state[2] = proposals
+        dump()
+
+    #garbage collection
+    def OnPerformed(s, p):
+        '''A op is performed by replica, check whether all replicas performed it. 
+           If so, send Release to acceptors so they can remove this pvalue. -- garbage collection'''
+        performed[s] -=  1
+        if performed[s] == 0:
+            send(Release(s), acceptors)
+            del performed[s]
+        state[4] = performed
+        dump()
+
+    def OnNotify(a, a_index):
+        '''an acceptor recovers, update acceptors set'''
+        acceptors[a_index] = a
+        spawn(Scout, [self, acceptors, ballot_num, first_slot])
+    
+    def OnStop():
+        '''replica sends Stop msg'''
+        send(Stop(), acceptors)
+        done = True
+
+    def recover():
+        '''recover from crash:
+           1. open log file
+           2. retrieve state
+           3. send notification to replicas and acceptors
+        '''
+        try:
+            log = open('./leader'+str(index)+'.log','rb+',0)
+        except IOError:
+            output('recovery fails')
+        else:
+            try:
+                state = pickle.load(log)
+            except pickle.PickleError:
+                output('recovery fails')
+            else:
+                ballot_num = state[0]
+                active = state[1]
+                proposals =state[2]
+                first_slot = state[3]
+                performed = state[4]
+
+        send(Notify(self, index), replicas | set(acceptors))
+       
+    def dump():
+        '''save the state'''
+        log.truncate(0)
+        log.seek(0)
+        try:
+            pickle.dump(state, log)
+        except pickle.PickleError:
+            output('dump error')
+
+    def circle_plus(x, y):
+        '''returns the elements of y as well as the elements of x that are not in y'''
+        return y | {(s, p) for (s, p) in x
+                      if not {p1 for (s0, p1) in y if s0 == s}}
+
+    def pmax(pvals):
+        '''determine for each slot the command corresponding to the maximum ballot number in pvals'''
+        return {(s, p) for (b, s, p) in pvals
+                if all(b1 <= b for (b1, s0, p1) in pvals if s0 == s)}
+    
+
+class Commander(DistProcess):
+    def setup(lam, acceptors, replicas, load):
+        '''set up the commander'''
+        #use dict to replace set and get O(1)
+        #total, count also for O(1)
+        waitfor = dict.fromkeys(acceptors, 1)
+        total = len(acceptors)
+        count = total
+
+        b, s, p = load
+        done = False
+
+    def main():
+        '''send P2a and wait for reply'''
+        send(P2a(self, (b, s, p)), acceptors)
+        await(done)
+
+    def OnP2b(a, b1):
+        '''handle reply from acceptors'''
+        if (b1 == b):
+            if waitfor[a] == 1:
+                waitfor[a] = 0
+                count -= 1
+            if count < total/2:
+                send(Decision(s, p), replicas | {lam})
+                done = True
+        else:
+            send(Preempted(b1), lam)
+            done = True
+
+class Scout(DistProcess):
+    def setup(lam, acceptors, b, first_slot):
+        '''set up the scout'''
+        #use dict to replace set and get O(1)
+        #total, count also for O(1)
+        waitfor = dict.fromkeys(acceptors, 1)
+        total = len(acceptors)
+        count = total
+
+        pvalues = set()
+        done = False
+
+    def main():
+        '''send P1a and wait for reply'''
+        time.sleep(random.random())
+        send(P1a(self, b, first_slot), acceptors)
+        await(done)
+
+    def OnP1b(a, b1, r):
+        '''handle reply from acceptors'''
+        if b1 == b:
+            pvalues |= r
+            if waitfor[a] == 1:
+                waitfor[a] = 0
+                count -= 1
+            if count < total/2:
+                send(Adopted(b, pvalues), lam)
+                done = True
+        else:
+            send(Preempted(b1), lam)
+            done = True
+
+class Client(DistProcess):
+    def setup(replicas, nrequests):
+        '''set up the client
+           nrequests: if ==0, won't stop sending requests
+                      if > 0, will stop after sends n requests
+        '''
+        cid = 0
+        results = dict()
+        count = dict()
+
+    def main():
+        '''send request to replicas and wait for the reply'''
+        while (nrequests == 0 or cid < nrequests):
+            send(Request((self, cid, randint(0, NOPS-1))), replicas)
+            await(results.get(cid) != None and count.get(cid) == len(replicas))
+            output("%d Received result %d:%d" % (self.pid, cid, results[cid]))
+            cid += 1
+            time.sleep(0.2)
+        time.sleep(2)
+        send(Stop(), replicas)
+
+    def OnResponse(cid, result):
+        '''handle response from replicas, determine whether it's out of sync or not'''
+        if results.get(cid) == None:
+            results[cid] = result
+            count[cid] = 1
+        else:
+            if results[cid] != result:
+                output("Replicas out of sync at cid(%d) : %d - %d " %
+                       (cid, results[cid], result))
+            else:
+                count[cid] += 1

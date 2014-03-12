@@ -1,0 +1,38 @@
+dist_source(".","paxos.da")
+from paxos import *
+"""Test Case 0:
+    simply run the code with 5 acceptors, 5 replicas, 3 leaders, 5 clients.
+    no error.
+    the processes keep running unless no. of requests specified for clients.
+    """
+
+def main():
+    nacceptors = 5
+    nreplicas = 5
+    nleaders = 3
+    nclients = 5
+
+    use_channel("udp")
+    replicas = createprocs(Replica, nreplicas)    
+    acceptors = list(createprocs(Acceptor, nacceptors))
+    leaders = list(createprocs(Leader, nleaders))
+    
+    #the second arg: 0 for infinite requests, >0 for finite requests and will stop the protocal
+    clients = createprocs(Client, nclients, (replicas, 0))
+    #uncomment the following line if want processes stop automatically (30 requests from client)
+    #clients = createprocs(Client, nclients, (replicas, 30))    
+    
+    for i in range(nacceptors):
+        setupprocs( [acceptors[i]], [leaders, i, False])
+    
+    for i in range(nleaders):
+        setupprocs( [leaders[i]], [acceptors, replicas, i, False])
+
+    setupprocs(replicas, (leaders, 0))
+
+    startprocs(acceptors)
+    startprocs(replicas | set(leaders))
+    startprocs(clients)
+   
+    for p in set(acceptors) | replicas | set(leaders) | clients: p.join()
+
